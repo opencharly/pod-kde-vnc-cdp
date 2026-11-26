@@ -1,0 +1,888 @@
+#  opencharly/pod-kde-vnc-cdp — the KDE-over-VNC pod WITH the org's full CDP surface.
+#
+#  The stack is pod-kde-vnc's, unchanged:
+#
+#    sway (headless, pod-sway)  ── serves wayland-0 ──►  wayvnc (pod-wayvnc) ── :5900
+#        └─ KWin (nested, --socket wayland-kde) as sway's ONE fullscreen window
+#              └─ plasmashell + KDE apps on wayland-kde
+#
+#  and this pod adds the browser automation every other streaming pod has:
+#
+#    Chrome as a PLASMA WINDOW (on wayland-kde), supervised, maximized
+#      └─ chrome-wrapper ── CDP on 127.0.0.1:9223
+#            └─ cdp-proxy ── 0.0.0.0:9222  (Host + webSocketDebuggerUrl rewriting)
+#      └─ chrome-devtools-mcp ── Streamable HTTP on :9224
+#
+#  Why ONE pod and not a second container: the CDP surface must drive the browser the VNC
+#  user SEES. A separate headless driver would expose a different browser with a different
+#  --user-data-dir, and every "watch it happen" claim (the OAuth screens, a page the operator
+#  can take over over VNC) would be false.
+#
+#  The GPU reaches the image from the HOST through CDI (pod-cdi composes layer-cdi and never
+#  bakes a driver); nothing here composes layer-nvidia.
+
+import:
+    # A builder map does NOT cross a namespace boundary: a box composed here declares its own
+    # (kdotool, via layer-kde-shell, is an AUR package; chrome-devtools-mcp needs npm + pixi).
+    # These are the same pins pod-kde-vnc uses, so the pod this repo composes and the base it
+    # sits on are built from one generation.
+    - arch: '@github.com/opencharly/distro-arch:v2026.326.1455'
+    - podcdi: '@github.com/opencharly/pod-cdi:v2026.326.1530'
+    # The CachyOS base for the cross-deployment SUBJECT. The KDE pod itself sits on pod-cdi
+    # (it needs the GPU); a web fixture must not, so the subject takes the plain CachyOS base.
+    - cachyos: '@github.com/opencharly/distro-cachyos:v2026.330.1249'
+
+kde-vnc-cdp-session:
+    candy:
+        description: |
+            The KDE-over-VNC session with the org's full Chrome DevTools Protocol surface: the
+            proven kde-vnc-session (pod-kde-vnc's sway + wayvnc + nested Plasma) plus chrome-cdp
+            (chrome-wrapper, cdp-proxy on 9222, browser-open, chrome-restart, the chrome-windows
+            extension, BROWSER_CDP_URL) and the composed chrome-devtools-mcp (9224), with Chrome
+            declared as a SUPERVISED program on the Plasma socket so it waits for KWin, restarts
+            on exit, and lands as a window the VNC stream shows.
+            Every claim is observable: the assembled supervisord entry and the ambient session
+            env at build time, and at runtime the RUNNING browser, a KWin client running
+            maximized, every cdp: method answering through the proxy except screenshot, which is a
+            measured GPU-Wayland limit (opencharly/plugin-cdp#14; the VNC frame carries the visual
+            claim), the MCP tool catalog, and
+            VNC pointer/keyboard input reaching the browser and visible in the frame.
+        require:
+            # The desktop: sway + wayvnc + the shared nested Plasma session. pod-kde-vnc is
+            # ARCHIVED (umbrella#1295 retired the desktop closure with "no replacement"), so the
+            # pin is deliberate and the two corrections this pod needs from that closure live HERE
+            # rather than upstream — see the helpers below.
+            # v2026.330.1628 is the release that sets the image's session pair
+            # (WAYLAND_DISPLAY=wayland-kde, KDE_SESSION_VERSION=6, opencharly/pod-kde-vnc#7), so
+            # this pod no longer carries a copy of it.
+            - '@github.com/opencharly/pod-kde-vnc:v2026.330.1628'
+            # The CDP toolkit: chrome-wrapper, cdp-proxy (9222), browser-open, chrome-restart,
+            # the chrome-windows extension, BROWSER/BROWSER_CDP_URL, and the composed
+            # chrome-devtools-mcp (9224). Container-only, like every feature it installs.
+            # v2026.330.1834 is the release whose chrome-restart / browser-open restart a SUPERVISED browser
+            # through the init system that owns it (opencharly/pod-chrome-cdp#10), so this pod no
+            # longer carries copies of them.
+            - '@github.com/opencharly/pod-chrome-cdp:v2026.330.1834'
+            # plugin-cdp serves the `cdp:` check verb. Pinned to the release that fixes `close`'s tab
+            # resolution and bounds the screenshot's surface capture (opencharly/plugin-cdp#15):
+            # the archived pod-chrome-cdp pin above names a release older than both, and this pin is
+            # the one the project's plugin set resolves.
+            - '@github.com/opencharly/plugin-cdp/candy/plugin-cdp:v2026.330.1608'
+        service:
+            # Chrome is SUPERVISED, not launched from a compositor's config: this pod's desktop
+            # shows Plasma, so the browser must join KWin's socket (`wayland-kde`) — the socket
+            # behind the fullscreen window (`wayland-0`) is the one that would render it where
+            # nobody can see it. wait_for makes the start self-synchronizing: KWin binds its
+            # socket before the browser execs, so a slow nested session fails THE SERVICE with a
+            # reason instead of looking like a browser crash. start_sec resets the retry budget
+            # once the browser has been up past its own startup transient, so a single early
+            # exit never leaves it FATAL. The env is restated here on purpose: a service must
+            # not depend on ambient drift, and wait_for needs a literal path.
+            - name: chrome
+              exec: "%(ENV_HOME)s/.local/bin/chrome-wrapper"
+              env:
+                  WAYLAND_DISPLAY: wayland-kde
+                  XDG_RUNTIME_DIR: /tmp
+              restart: always
+              start_sec: 5
+              start_retry: 3
+              priority: 30
+              stdout: "file:/tmp/chrome.log"
+              enable: true
+              scope: system
+              wait_for:
+                  paths:
+                      - /tmp/wayland-kde
+                  timeout: 60s
+        plan:
+            - check: the assembled supervisord config carries this pod's supervised Chrome, execs the wrapper, and points it at the PLASMA socket
+              id: kde-vnc-cdp-chrome-supervised
+              file:
+                  file: /etc/supervisord.conf
+                  exists: true
+                  contains:
+                      - contains: "[program:chrome]"
+                      - contains: "chrome-wrapper"
+                      - contains: 'WAYLAND_DISPLAY="wayland-kde"'
+            - check: the CDP toolkit's own contract is intact in this image — the browser binary, the proxy's ports, and the helper set
+              id: kde-vnc-cdp-toolkit
+              command: test -x /usr/bin/google-chrome-stable && test -x "$HOME/.local/bin/cdp-proxy" && test -x "$HOME/.local/bin/chrome-wrapper" && test -x "$HOME/.local/bin/browser-open" && test -x "$HOME/.local/bin/chrome-restart" && echo toolkit-ok
+              exit_status: 0
+              stdout:
+                  - contains: toolkit-ok
+
+kde-vnc-cdp:
+    candy:
+        description: |
+            The pod-kde-vnc desktop with the org's full CDP surface: a fullscreen, GPU-accelerated
+            KDE Plasma over VNC on :5900, a SUPERVISED Chrome as a Plasma window, CDP on :9222
+            through cdp-proxy, and chrome-devtools-mcp on :9224 — built on the CDI GPU pod base
+            (opencharly/pod-cdi), so the driver comes from the host and none is baked in.
+        base: podcdi.pod-cdi
+        platform:
+            - linux/amd64
+        build:
+            - pac
+        builder:
+            aur: arch.arch-builder
+            cargo: arch.arch-builder
+            npm: arch.arch-builder
+            pixi: arch.arch-builder
+        candy:
+            - kde-vnc-cdp-session
+        plan:
+            # The same floors pod-kde-vnc's image asserts; this image makes the same claim about
+            # the compositor and the VNC server it ships.
+            - check: sway is at least 1.12, the latest upstream release
+              id: kde-vnc-cdp-sway-version
+              exit_status: 0
+              stdout:
+                  - matches: "^sway version 1\\.(1[2-9]|[2-9][0-9])"
+              command: sway --version
+            - check: wayvnc is at least 0.10.2, the latest upstream release
+              id: kde-vnc-cdp-wayvnc-version
+              exit_status: 0
+              stdout:
+                  - matches: "^wayvnc 0\\.(10\\.([2-9]|[1-9][0-9])|1[1-9]\\.)"
+              command: pacman -Q wayvnc
+            - check: no host-side nvidia-ctk is baked into the image (the CDI pod contract)
+              id: kde-vnc-cdp-no-nvidia-ctk
+              exit_status: 0
+              command: "! command -v nvidia-ctk"
+
+# Disposable R10 bed: builds kde-vnc-cdp, deploys it, and proves the desktop AND the whole CDP
+# surface live. Every step is a `check:` step with `context: [runtime]`: a bed's `run:` steps are
+# verify-only (skipped) in check-live, and `deploy` is not a check mode.
+check-kde-vnc-cdp-pod:
+    pod:
+        image: kde-vnc-cdp
+        disposable: true
+        lifecycle: dev
+        description: >-
+            Sole proof of pod-kde-vnc-cdp: the KDE-over-VNC desktop runs; Chrome is a supervised
+            KWin client filling the screen; the cdp: methods answer through the 9222 proxy; the
+            chrome-devtools-mcp catalog answers on 9224; browser-open and chrome-restart work;
+            and VNC can WATCH the page (OCR of the framebuffer) and DRIVE it (pointer + keyboard),
+            which is what "remote browser automation of what the user sees" means.
+        plan:
+            # --- absence before -------------------------------------------------------------
+            - check: before any input, the marker the typed command creates does not exist
+              id: bed-input-absent
+              context: [runtime]
+              file:
+                  file: /tmp/kde-vnc-cdp-input-ok
+                  exists: false
+
+            # --- the desktop (inherited claims, re-asserted here) ---------------------------
+            - check: sway, wayvnc, the nested Plasma session, Chrome, the CDP proxy and the MCP bridge are all RUNNING
+              id: bed-services
+              context: [runtime]
+              eventually: 120s
+              retry_interval: 3s
+              exit_status: 0
+              stdout:
+                  - equals: RUNNING
+              command:
+                  command: supervisorctl status sway wayvnc kde-nested chrome cdp-proxy chrome-devtools-mcp | awk '{print $2}' | sort -u
+                  in_container: true
+            - check: the supervised browser stays up past its startup transient (supervisord relaunches it; it is not raced)
+              id: bed-chrome-stable
+              context: [runtime]
+              eventually: 150s
+              retry_interval: 5s
+              exit_status: 0
+              command:
+                  command: |
+                      out=$(supervisorctl status chrome)
+                      echo "$out"
+                      echo "$out" | awk '/RUNNING/{n=split($NF,a,":"); s=a[n]+a[n-1]*60+a[n-2]*3600; if(s>=25){f=1}} END{exit !f}'
+                  in_container: true
+            - check: the nested KWin window is fullscreen in sway
+              id: bed-kwin-fullscreen
+              context: [runtime]
+              eventually: 60s
+              retry_interval: 3s
+              exit_status: 0
+              stdout:
+                  - contains: '"fullscreen_mode": 1'
+              command:
+                  command: |
+                      SWAYSOCK=$(ls -t /tmp/sway-ipc.*.sock | head -1) swaymsg -t get_tree \
+                        | grep -A40 '"name": "KDE Wayland Compositor' | grep -m1 '"fullscreen_mode"'
+                  in_container: true
+            - check: KWin composites with hardware OpenGL, not the llvmpipe software rasterizer
+              id: bed-kwin-gpu
+              context: [runtime]
+              eventually: 60s
+              retry_interval: 3s
+              exit_status: 0
+              stdout:
+                  - contains: "Compositing Type: OpenGL"
+                  - matches: "OpenGL renderer string: (NVIDIA|AMD|Intel|Radeon)"
+                  - not_contains: llvmpipe
+              command:
+                  command: qdbus6 org.kde.KWin /KWin supportInformation | grep -E 'Compositing Type|OpenGL renderer string'
+                  in_container: true
+            - check: the VNC server answers on the published port with the configured resolution
+              id: bed-vnc-status
+              context: [runtime]
+              eventually: 60s
+              retry_interval: 3s
+              vnc: status
+              stdout:
+                  - contains: "1920x1080"
+            - check: the VNC framebuffer is a full, non-uniform frame of the desktop
+              id: bed-vnc-frame
+              context: [runtime]
+              vnc:
+                  method: screenshot
+                  artifact: /tmp/check-kde-vnc-cdp-frame.png
+                  artifact_min_dimensions: 1920x1080
+                  artifact_not_uniform: true
+
+            # --- Chrome is a KWin client, MAXIMIZED (browser side and compositor side) --------
+            - check: the browser reports itself maximized against the session's available area (the flag took effect, it was not merely passed)
+              id: bed-chrome-maxok
+              context: [runtime]
+              eventually: 90s
+              retry_interval: 3s
+              cdp:
+                  method: eval
+                  tab: "1"
+                  expression: "(window.outerWidth >= screen.availWidth - 60 && window.outerHeight >= screen.availHeight - 60) ? 'MAXOK' : ('MAXBAD ' + window.outerWidth + 'x' + window.outerHeight + ' avail ' + screen.availWidth + 'x' + screen.availHeight)"
+              stdout:
+                  - contains: MAXOK
+
+            # --- every cdp: method, through the 9222 proxy ----------------------------------
+            - check: the CDP proxy answers
+              id: bed-cdp-status
+              context: [runtime]
+              eventually: 90s
+              retry_interval: 3s
+              cdp: status
+              stdout:
+                  - contains: ok
+            - check: at least one tab exists after the supervised start
+              id: bed-cdp-list
+              context: [runtime]
+              cdp: list
+              stdout:
+                  - matches: "."
+            - check: "cdp: open opens a page in the running browser"
+              id: bed-cdp-open
+              context: [runtime]
+              cdp:
+                  method: open
+                  url: about:blank
+            # The elements are injected with an eval, NOT via a data: URL: a data: URL's quoted
+            # attributes do not survive the HTTP open path (measured — #b and #i were absent while
+            # the unquoted text rendered), so the page is built where quoting is not re-encoded.
+            - check: the demo page is built in the browser and reports ready
+              id: bed-cdp-page
+              context: [runtime]
+              cdp:
+                  method: eval
+                  tab: "1"
+                  expression: |
+                      document.title='charly-cdp';
+                      document.body.innerHTML='<h1>CHARLYCDP</h1><button id=b>B</button><input id=i>';
+                      document.getElementById('b').onclick=function(){document.title='CLICKED'};
+                      'PAGE-READY'
+              stdout:
+                  - contains: PAGE-READY
+            - check: "the opened page is the browser's current tab (cdp: url)"
+              id: bed-cdp-url
+              context: [runtime]
+              eventually: 30s
+              retry_interval: 2s
+              cdp:
+                  method: url
+                  tab: "1"
+              stdout:
+                  - contains: charly-cdp
+            - check: "the page text carries the marker (cdp: text)"
+              id: bed-cdp-text
+              context: [runtime]
+              cdp:
+                  method: text
+                  tab: "1"
+              stdout:
+                  - contains: CHARLYCDP
+            - check: "the page HTML carries the marker (cdp: html)"
+              id: bed-cdp-html
+              context: [runtime]
+              cdp:
+                  method: html
+                  tab: "1"
+              stdout:
+                  - contains: CHARLYCDP
+            - check: "cdp: eval reads the document title"
+              id: bed-cdp-eval
+              context: [runtime]
+              cdp:
+                  method: eval
+                  tab: "1"
+                  expression: document.title
+              stdout:
+                  - contains: charly-cdp
+            # THE bounded-capture assertion. Its contract is the FIX, not a painted frame: the verb
+            # must RETURN a capture within a budget far below the old behaviour. Without the fix the
+            # surface capture never returns and this step dies on the per-attempt never-hang bound;
+            # with it, the surface attempt is abandoned after 20s and the view capture lands a PNG.
+            # (The frame it lands is blank on this GPU Wayland Chrome — opencharly/plugin-cdp#14 —
+            # so CONTENT is not asserted here; the pod's visual claim is the VNC frame + OCR.)
+            - check: "cdp: screenshot returns a capture within the budget instead of hanging"
+              id: bed-cdp-screenshot
+              context: [runtime]
+              timeout: 60s
+              cdp:
+                  method: screenshot
+                  tab: "1"
+                  artifact: /tmp/check-kde-vnc-cdp-page.png
+                  artifact_min_bytes: 5000
+                  artifact_min_dimensions: 400x300
+            - check: "cdp: wait resolves a selector that is present"
+              id: bed-cdp-wait
+              context: [runtime]
+              timeout: 40s
+              cdp:
+                  method: wait
+                  tab: "1"
+                  selector: "#b"
+            - check: "cdp: raw sends a protocol command and returns its result"
+              id: bed-cdp-raw
+              context: [runtime]
+              cdp:
+                  method: raw
+                  tab: "1"
+                  http_method: Browser.getVersion
+                  params: "{}"
+              exit_status: 0
+              stdout:
+                  - contains: product
+            # `cdp: screenshot` is NOT asserted on this pod, and that is a measured limit, not an
+            # omission: on this GPU Wayland Chrome the surface capture never returns and the
+            # plugin's renderer-view fallback comes back uniformly white EVERY time (4/4 attempts,
+            # 99s; opencharly/plugin-cdp#14). Polling cannot fix a capture that is blank by
+            # construction, and the repeated capture attempts also disturb the page the OCR step
+            # below reads. The visual claim is therefore carried by the VNC frame — what the
+            # streamed user actually SEES — captured with `vnc:` and read by host OCR.
+            - check: "cdp: click clicks a selector and the page reacts"
+              id: bed-cdp-click
+              context: [runtime]
+              cdp:
+                  method: click
+                  tab: "1"
+                  selector: "#b"
+            - check: the click's effect is observable in the page (document.title)
+              id: bed-cdp-click-effect
+              context: [runtime]
+              eventually: 20s
+              retry_interval: 2s
+              cdp:
+                  method: eval
+                  tab: "1"
+                  expression: document.title
+              stdout:
+                  - equals: CLICKED
+            - check: "cdp: type types into a field and the value reads back exactly"
+              id: bed-cdp-type
+              context: [runtime]
+              cdp:
+                  method: type
+                  tab: "1"
+                  selector: "#i"
+                  text: charly
+            - check: "the typed value is in the field (cdp: eval)"
+              id: bed-cdp-type-effect
+              context: [runtime]
+              eventually: 20s
+              retry_interval: 2s
+              cdp:
+                  method: eval
+                  tab: "1"
+                  expression: document.getElementById('i').value
+              stdout:
+                  - equals: charly
+            - check: "cdp: coords reports the element in viewport AND desktop systems (the locate half of the VNC click path)"
+              id: bed-cdp-coords
+              context: [runtime]
+              cdp:
+                  method: coords
+                  tab: "1"
+                  selector: "#b"
+              stdout:
+                  - contains: "Viewport:"
+                  - contains: "Desktop:"
+            - check: "cdp: axtree dumps the accessibility tree"
+              id: bed-cdp-axtree
+              context: [runtime]
+              timeout: 40s
+              cdp:
+                  method: axtree
+                  tab: "1"
+              exit_status: 0
+              stdout:
+                  - matches: "."
+            - check: "cdp: close closes the tab and the tab list no longer carries it"
+              id: bed-cdp-close
+              context: [runtime]
+              cdp:
+                  method: close
+                  tab: "1"
+
+            # --- WATCH it over VNC: the framebuffer itself spells the page ------------------
+            - check: "cdp: open shows the marker page for the VNC frame"
+              id: bed-cdp-open-marker
+              context: [runtime]
+              cdp:
+                  method: open
+                  url: about:blank
+            # CHARLYCDP is one word on purpose: the VNC-frame assertion is OCR, and a hyphenated
+            # token is the one thing OCR reliably mangles.
+            - check: the marker page is built in the browser
+              id: bed-cdp-marker-page
+              context: [runtime]
+              cdp:
+                  method: eval
+                  tab: "1"
+                  expression: |
+                      document.title='charly-marker';
+                      document.body.style.margin='0';
+                      document.body.innerHTML='<h1 style="font-size:120px">CHARLYCDP</h1><input id=i style="font-size:56px;width:100%">';
+                      'MARKER-READY'
+              stdout:
+                  - contains: MARKER-READY
+            # The window is found by the TITLE THE BED ITSELF PUT ON IT, so the search is
+            # deterministic rather than a guess at Chrome's default window name; a miss dumps
+            # every window KWin reports, which is the evidence needed to correct the selector.
+            - check: the browser is a window of the nested KWin, and it is the page this bed opened
+              id: bed-chrome-is-kwin-client
+              context: [runtime]
+              eventually: 60s
+              retry_interval: 3s
+              exit_status: 0
+              stdout:
+                  - contains: charly-marker
+              command:
+                  command: |
+                      found=""
+                      for id in $(kdotool search --name '.*' 2>/dev/null); do
+                        name=$(kdotool getwindowname "$id" 2>/dev/null)
+                        echo "kwin-window $id $name"
+                        case "$name" in *charly-marker*) found=$id;; esac
+                      done
+                      [ -n "$found" ] || { echo "no window titled charly-marker among the KWin windows above" >&2; exit 1; }
+                      kdotool getwindowname "$found"
+                  in_container: true
+            - check: the COMPOSITOR agrees — the browser's window geometry fills the 1920x1080 output
+              id: bed-chrome-maximized-geometry
+              context: [runtime]
+              eventually: 60s
+              retry_interval: 3s
+              exit_status: 0
+              stdout:
+                  - contains: geometry ok
+              command:
+                  command: |
+                      id=""
+                      for wid in $(kdotool search --name '.*' 2>/dev/null); do
+                        case "$(kdotool getwindowname "$wid" 2>/dev/null)" in *charly-marker*) id=$wid;; esac
+                      done
+                      test -n "$id" || { echo "no charly-marker window to measure" >&2; exit 1; }
+                      geo=$(kdotool getwindowgeometry "$id")
+                      echo "$geo"
+                      w=$(echo "$geo" | sed -n 's/.*Geometry: \([0-9]*\)x\([0-9]*\).*/\1/p')
+                      h=$(echo "$geo" | sed -n 's/.*Geometry: \([0-9]*\)x\([0-9]*\).*/\2/p')
+                      test -n "$w" && test -n "$h" || { echo "no geometry parsed from: $geo" >&2; exit 1; }
+                      test "$w" -ge 1800 && test "$h" -ge 1000 && echo "geometry ok: ${w}x${h}" || { echo "not maximized: ${w}x${h}" >&2; exit 1; }
+                  in_container: true
+            - check: the VNC framebuffer is captured host-side for the OCR assertion
+              id: bed-vnc-frame-for-ocr
+              context: [runtime]
+              timeout: 120s
+              vnc:
+                  method: screenshot
+                  artifact: /tmp/check-kde-vnc-cdp-ocr.png
+                  artifact_min_dimensions: 1920x1080
+                  artifact_not_uniform: true
+            # The frame is read by the host's OCR engine in a host-side command: the `vnc:` verb
+            # does not carry `artifact_contains_text` (measured: "#VncInput.artifact_contains_text:
+            # field not allowed"), so the same instrument is driven explicitly over the captured
+            # desktop instead of being unavailable.
+            - check: the STREAMED FRAME shows the page's own text — OCR of the captured desktop, not of the browser's own screenshot
+              id: bed-vnc-shows-page
+              context: [runtime]
+              timeout: 120s
+              exit_status: 0
+              stdout:
+                  - contains: HARLY
+              command:
+                  command: |
+                      tesseract /tmp/check-kde-vnc-cdp-ocr.png - --psm 11 2>/dev/null | tr -s ' ' ' ' | grep -Ei -m1 'charly[^a-z]*cdp'
+                  in_container: false
+
+            # --- DRIVE it over VNC: pointer + keyboard reach the browser --------------------
+            # The maximized window covers the screen centre (asserted above), so a click at the
+            # centre is inside the page's body — no coordinate chaining between steps (the check
+            # framework carries no state between steps; a vnc click takes literal coords).
+            - check: the page arms a body click that the VNC pointer will trigger
+              id: bed-vnc-arm-body-click
+              context: [runtime]
+              cdp:
+                  method: eval
+                  tab: "1"
+                  expression: "document.body.style.height='100vh';document.body.onclick=function(){document.title='VNC-CLICKED'};document.title='ARMED';'ARMED'"
+              stdout:
+                  - contains: ARMED
+            - check: a VNC pointer click at the desktop centre is delivered into the page
+              id: bed-vnc-click
+              context: [runtime]
+              vnc:
+                  method: click
+                  x: 960
+                  y: 540
+            - check: the VNC-delivered click reached the page (document.title changed)
+              id: bed-vnc-click-effect
+              context: [runtime]
+              eventually: 30s
+              retry_interval: 2s
+              cdp:
+                  method: eval
+                  tab: "1"
+                  expression: document.title
+              stdout:
+                  - equals: VNC-CLICKED
+            - check: the input field is focused through CDP, ready for VNC keystrokes
+              id: bed-vnc-focus-input
+              context: [runtime]
+              cdp:
+                  method: eval
+                  tab: "1"
+                  expression: "document.getElementById('i').focus();document.activeElement.id"
+              stdout:
+                  - equals: i
+            - check: VNC keystrokes type into the focused field
+              id: bed-vnc-type
+              context: [runtime]
+              vnc:
+                  method: type
+                  text: charlyvnc
+            - check: the VNC-typed text is in the field (CDP reads it back)
+              id: bed-vnc-type-effect
+              context: [runtime]
+              eventually: 30s
+              retry_interval: 2s
+              cdp:
+                  method: eval
+                  tab: "1"
+                  expression: document.getElementById('i').value
+              stdout:
+                  - equals: charlyvnc
+            - check: the VNC-typed text is visible in the STREAMED frame (host-side OCR of the captured desktop)
+              id: bed-vnc-type-visible
+              context: [runtime]
+              timeout: 120s
+              vnc:
+                  method: screenshot
+                  artifact: /tmp/check-kde-vnc-cdp-typed.png
+                  artifact_min_dimensions: 1920x1080
+                  artifact_not_uniform: true
+            - check: the typed text the frame carries is the text CDP read back (OCR, case-insensitive)
+              id: bed-vnc-type-ocr
+              context: [runtime]
+              timeout: 120s
+              exit_status: 0
+              stdout:
+                  - contains: charlyvnc
+              command:
+                  command: |
+                      tesseract /tmp/check-kde-vnc-cdp-typed.png - --psm 11 2>/dev/null | tr -s ' ' ' ' | grep -i -m1 'charlyvnc'
+                  in_container: false
+
+            # --- the helpers and the MCP bridge ---------------------------------------------
+            - check: $BROWSER routes a URL into the running browser (browser-open)
+              id: bed-browser-open
+              context: [runtime]
+              exit_status: 0
+              command:
+                  command: browser-open http://127.0.0.1:9222/json/version
+                  in_container: true
+            - check: the URL browser-open asked for is a tab in the browser
+              id: bed-browser-open-tab
+              context: [runtime]
+              eventually: 30s
+              retry_interval: 2s
+              cdp: list
+              stdout:
+                  - contains: /json/version
+            # browser-open's supervised branch is only reached when the browser is DOWN, so the bed
+            # stops it first: a URL opened against a RUNNING browser returns from the fast path and
+            # never exercises the delegation this change adds.
+            - check: the supervised browser is STOPPED, so the next URL must restore it through its owner
+              id: bed-browser-open-stop
+              context: [runtime]
+              exit_status: 0
+              stdout:
+                  - contains: STOPPED
+              command:
+                  command: |
+                      supervisorctl stop chrome >/dev/null
+                      supervisorctl status chrome | awk '{print $2}'
+                  in_container: true
+            - check: browser-open brings the STOPPED supervised browser back and opens the URL
+              id: bed-browser-open-supervised
+              context: [runtime]
+              timeout: 120s
+              exit_status: 0
+              command:
+                  command: browser-open http://127.0.0.1:9222/json/version
+                  in_container: true
+            - check: after that, the browser is RUNNING under the supervisor again
+              id: bed-browser-open-supervised-effect
+              context: [runtime]
+              eventually: 120s
+              retry_interval: 5s
+              exit_status: 0
+              stdout:
+                  - contains: RUNNING
+              command:
+                  command: supervisorctl status chrome | awk '{print $2}'
+                  in_container: true
+            - check: chrome-restart restarts the SUPERVISED browser and CDP answers again
+              id: bed-chrome-restart
+              context: [runtime]
+              timeout: 120s
+              exit_status: 0
+              command:
+                  command: |
+                      chrome-restart >/tmp/bed-chrome-restart.log 2>&1
+                      echo "restart rc=$?"
+                  in_container: true
+              stdout:
+                  - contains: "restart rc=0"
+            - check: after the restart the browser is RUNNING under the supervisor
+              id: bed-chrome-restart-live
+              context: [runtime]
+              eventually: 120s
+              retry_interval: 5s
+              exit_status: 0
+              command:
+                  command: supervisorctl status chrome | awk '{print $2}'
+                  in_container: true
+              stdout:
+                  - contains: RUNNING
+            - check: CDP answers after the restart
+              id: bed-cdp-after-restart
+              context: [runtime]
+              eventually: 120s
+              retry_interval: 5s
+              cdp: status
+              stdout:
+                  - contains: ok
+            - check: the browser is maximized AGAIN after the restart (the startup path maximizes, it is not a one-off)
+              id: bed-maxok-after-restart
+              context: [runtime]
+              eventually: 120s
+              retry_interval: 5s
+              cdp:
+                  method: eval
+                  tab: "1"
+                  expression: "(window.outerWidth >= screen.availWidth - 60 && window.outerHeight >= screen.availHeight - 60) ? 'MAXOK' : ('MAXBAD ' + window.outerWidth + 'x' + window.outerHeight + ' avail ' + screen.availWidth + 'x' + screen.availHeight)"
+              stdout:
+                  - contains: MAXOK
+            - check: the chrome-devtools-mcp bridge answers a protocol ping on 9224
+              id: bed-mcp-ping
+              context: [runtime]
+              timeout: 40s
+              eventually: 120s
+              retry_interval: 5s
+              mcp: ping
+              stdout:
+                  - contains: ok
+            - check: the MCP catalog advertises the browser-automation tools
+              id: bed-mcp-tools
+              context: [runtime]
+              timeout: 60s
+              eventually: 120s
+              retry_interval: 5s
+              mcp: list-tools
+              stdout:
+                  - contains: navigate_page
+                  - contains: take_screenshot
+
+            # --- the desktop's keyboard path (inherited) ------------------------------------
+            - check: a Konsole is launched inside the Plasma session with no extra environment
+              id: bed-open-konsole
+              context: [runtime]
+              exit_status: 0
+              command:
+                  command: |
+                      WAYLAND_DISPLAY=wayland-kde XDG_RUNTIME_DIR=/tmp DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/dbus-session setsid konsole >/tmp/konsole.log 2>&1 < /dev/null &
+                      echo launched
+                  in_container: true
+            - check: the Konsole window is found and made KWin's ACTIVE window, so VNC keystrokes reach it
+              id: bed-konsole-focused
+              context: [runtime]
+              eventually: 90s
+              retry_interval: 2s
+              exit_status: 0
+              stdout:
+                  - contains: Konsole
+              command:
+                  command: |
+                      id=$(kdotool search --name Konsole | head -1)
+                      test -n "$id" || {
+                        echo "no Konsole window in KWin yet" >&2
+                        echo "--- konsole.log ---" >&2; cat /tmp/konsole.log 2>/dev/null >&2
+                        echo "--- who/where ---" >&2
+                        id >&2
+                        ps -eo pid,args 2>/dev/null | grep -m3 -i konsole >&2
+                        ls -l /tmp/wayland-kde /tmp/dbus-session 2>&1 >&2
+                        printf 'WAYLAND=%s DBUS=%s\n' "$WAYLAND_DISPLAY" "$DBUS_SESSION_BUS_ADDRESS" >&2
+                        exit 1
+                      }
+                      KDE_SESSION_VERSION=6 kdotool windowactivate "$id"
+                      KDE_SESSION_VERSION=6 kdotool getactivewindow getwindowname
+                  in_container: true
+            - check: a command is typed into the Konsole through VNC key events
+              id: bed-konsole-type
+              context: [runtime]
+              vnc:
+                  method: type
+                  text: touch /tmp/kde-vnc-cdp-input-ok
+            - check: Return is pressed through VNC
+              id: bed-konsole-return
+              context: [runtime]
+              vnc:
+                  method: key
+                  key: Return
+            - check: the command typed over VNC ran inside the pod
+              id: bed-input-reached
+              context: [runtime]
+              eventually: 30s
+              retry_interval: 2s
+              file:
+                  file: /tmp/kde-vnc-cdp-input-ok
+                  exists: true
+            - agent-check: the streamed frame shows a fullscreen KDE Plasma desktop with a maximized Chrome window (title bar and page visible), not a black or gray frame
+
+kde-web-subject:
+    candy:
+        description: |
+            The CachyOS fixture-web SUBJECT for the pod-to-pod cross-deployment CDP bed: nginx
+            serving the org's predictable fixture page (pod-web-layer's `web-layer` candy) on 8080,
+            so the KDE pod's browser can render a SEPARATE pod over the shared charly net without
+            Chrome ever being baked into the subject's image.
+        base: cachyos.cachyos
+        platform:
+            - linux/amd64
+        build:
+            - pac
+        candy:
+            # v2026.330.1804 is the release that composes on Arch/CachyOS (opencharly/pod-web-layer#4),
+            # which this CachyOS subject needs.
+            - '@github.com/opencharly/pod-web-layer:v2026.330.1804'
+        plan:
+            # The fixture's own checks (nginx installed, marker in index.html, HTTP 200 with the
+            # marker) come with the candy; this image adds the one claim that is ITS: the page the
+            # subject serves is the one the cross-deployment bed drives.
+            - check: the fixture page the subject serves carries the marker the cross-deployment bed asserts on
+              id: kde-web-subject-fixture
+              file:
+                  file: /srv/fixture/index.html
+                  exists: true
+                  contains:
+                      - charly-fixture-web-content-marker
+
+# The pod-to-pod cross-deployment CDP mechanism's witness (opencharly/distro-fedora#140),
+# rebuilt on CachyOS+KDE. Its predecessor, check-cross-pod-cdp, drove a Fedora
+# `chrome-headless` member that was retired (opencharly/distro-fedora#138); the mechanism it
+# was the sole proof of — venue-from-position members + ${HOST:...} — had no successor.
+#
+# Shape: the web SUBJECT is the bed ROOT (a pod), and the KDE pod is a SIBLING MEMBER. Each
+# member's plan runs on ITS OWN venue: the `desktop` member's cdp: steps drive the KDE pod's
+# Chrome, and ${HOST:check-cross-kde-cdp-pod} resolves the root SUBJECT's container name on the
+# shared charly net — so the browser inside the driver fetches a page from ANOTHER pod: no host
+# loopback, no published port to the driver, and no Chrome baked into the subject image.
+check-cross-kde-cdp-pod:
+    pod:
+        image: kde-web-subject
+        disposable: true
+        lifecycle: dev
+        description: >-
+            Sole proof of pod->pod cross-deployment CDP probing on CachyOS+KDE: the web SUBJECT
+            pod is the bed root and the KDE pod is a sibling DRIVER member. Its cdp: steps
+            (venue = the desktop member) navigate to http://${HOST:check-cross-kde-cdp-pod}:8080
+            over the shared charly net and assert the subject's rendered marker; a VNC frame
+            proves the cross-pod page is what the streamed user sees.
+        plan:
+            - check: the web SUBJECT serves its fixture marker on its own published port
+              id: cross-web-subject-up
+              context: [runtime]
+              http:
+                  http: http://127.0.0.1:${HOST_PORT:8080}/
+                  status: 200
+                  body:
+                      - contains: charly-fixture-web-content-marker
+    desktop:
+        pod:
+            image: kde-vnc-cdp
+            plan:
+                - check: the DRIVER's Chrome navigates to the SUBJECT pod over the shared charly net
+                  id: cross-cdp-open-subject
+                  context: [runtime]
+                  timeout: 60s
+                  eventually: 60s
+                  retry_interval: 3s
+                  cdp:
+                      method: open
+                      url: http://${HOST:check-cross-kde-cdp-pod}:8080
+                - check: the SUBJECT's marker is rendered in the KDE pod's browser
+                  id: cross-cdp-subject-rendered
+                  context: [runtime]
+                  timeout: 150s
+                  # 90s, not 30s: one wedged CDP call cycle measured 37.8s under roster load, so a
+                  # 30s budget cannot fit a complete attempt and the retry interval buys nothing
+                  # (the predecessor bed, distro-fedora#140, carried the same reasoning).
+                  eventually: 90s
+                  retry_interval: 3s
+                  cdp:
+                      method: text
+                      tab: "1"
+                  stdout:
+                      - contains: charly-fixture-web-content-marker
+                - check: the cross-pod desktop is captured for the VNC assertion
+                  id: cross-vnc-frame
+                  context: [runtime]
+                  timeout: 120s
+                  # POLL: this member comes up seconds before its first painted frame, so a single
+                  # capture reads the compositor's grey pre-paint surface. `artifact_not_uniform`
+                  # re-drives the capture until the desktop has actually drawn.
+                  eventually: 120s
+                  retry_interval: 5s
+                  vnc:
+                      method: screenshot
+                      artifact: /tmp/check-cross-kde-cdp.png
+                      artifact_min_dimensions: 1920x1080
+                      artifact_not_uniform: true
+                - check: the cross-pod page is what the VNC user SEES — the fixture's own words read out of the streamed frame
+                  id: cross-cdp-visible-over-vnc
+                  context: [runtime]
+                  timeout: 120s
+                  exit_status: 0
+                  stdout:
+                      - contains: fixture
+                  command:
+                      command: |
+                          tesseract /tmp/check-cross-kde-cdp.png - --psm 11 2>/dev/null | tr -s ' ' ' ' | grep -i -m1 'fixture'
+                      in_container: false
+
+kde-vnc-cdp-skill:
+    skill:
+        name: kde-vnc-cdp
+        family: selkies
+        owner: kde-vnc-cdp-session
+        triggers:
+            - "pod-kde-vnc-cdp / the kde-vnc-cdp image / a KDE Plasma desktop over VNC that also serves Chrome DevTools Protocol (9222) and chrome-devtools-mcp (9224)"
+            - "driving a VNC-visible KDE browser by CDP (cdp: verb, browser-open, chrome-restart, BROWSER_CDP_URL) or watching it over VNC (vnc: screenshot + OCR)"
