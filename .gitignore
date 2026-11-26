@@ -1,0 +1,5 @@
+# charly build artifacts — never committed
+.build/
+.check/
+# the check-run feature stage's session recordings
+capture/
