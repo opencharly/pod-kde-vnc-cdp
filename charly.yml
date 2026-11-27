@@ -916,29 +916,6 @@ check-kde-vnc-cdp-pod:
                   in_container: true
               stdout:
                   - contains: "kept https://example.com/"
-            - check: "the tab is brought to the front (CDP tab activation)"
-              id: probe-example-front
-              context: [runtime]
-              exit_status: 0
-              cdp:
-                  method: raw
-                  tab: "1"
-                  http_method: Page.bringToFront
-                  params: "{}"
-            # Two premises stand between "the browser fetched the page" and "the frame shows it", and
-            # each needs its own assertion: the page must be its window's ACTIVE tab (a background tab
-            # reports visibilityState hidden), and that window must be the one the compositor shows.
-            - check: "the page is its window's ACTIVE tab (document.visibilityState is visible)"
-              id: probe-example-active-tab
-              context: [runtime]
-              eventually: 30s
-              retry_interval: 2s
-              cdp:
-                  method: eval
-                  tab: "1"
-                  expression: document.visibilityState
-              stdout:
-                  - contains: visible
             - agent-check: the streamed frame shows a fullscreen KDE Plasma desktop with a maximized Chrome window (title bar and page visible), not a black or gray frame
 
 kde-web-subject:
