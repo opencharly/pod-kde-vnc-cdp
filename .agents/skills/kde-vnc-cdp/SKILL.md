@@ -94,40 +94,36 @@ The external-page steps need outbound HTTPS from the host's pod network, and the
 copy of `https://example.com/` — so a proxy, a captive portal, or a cached page fails them by
 design, visibly, naming egress rather than the pod's internals.
 
-### A capture can carry a STALE frame — assert the premises, then capture TWICE
+### A single capture can carry a STALE frame — assert over the RECORDING
 
 Measured on this pod: after the supervised browser's `stop → browser-open → chrome-restart` cycle,
-presentation can stall in a way that is invisible to every metadata check. KWin still reports the
-window's title, geometry, desktop and activation; CDP still answers `title`, `text` and the target
-list; and the capture still returns a **complete, coherent, but old** frame — a *New Tab* page from
-before the navigation. Three rounds of window/tab assertions passed while the screen showed that old
-frame. What identifies the stall is the RENDERER, not the metadata:
+presentation can stall. KWin still reports the window's title, geometry, desktop and activation; CDP
+still answers `title`, `text` and the target list; and a one-shot `vnc: screenshot` returns a
+**complete, coherent, but old** frame — a *New Tab* page from before the navigation. Six rounds of
+window/tab/activation assertions passed while the screen showed that old frame.
 
 | probe | stalled | healthy |
 |---|---|---|
-| `Page.captureScreenshot` `fromSurface:true` | hangs | hangs (a known platform quirk) |
+| `Page.captureScreenshot` `fromSurface:true` | hangs | hangs (a platform quirk) |
 | `Page.captureScreenshot` `fromSurface:false` | **hangs** | answers instantly |
-| `vnc: screenshot`, first connection | old frame | current frame |
-| `vnc: screenshot`, the connection after it | current frame | current frame |
+| first `vnc: screenshot` after the stall | old frame | current frame |
+| the next `vnc: screenshot` | current frame | current frame |
 
-So a VNC-frame assertion in this repo is FOUR premises, each its own step:
+It is **racy**: the same sequence left the renderer healthy on one attempt, and one bed run kept the
+frame stale for 3m20s. So a frame assertion must not pin one instant:
 
-1. **The browser is painting** — a view capture answers within a budget (`eventually:` with a
-   `retry_interval:`, so the engine polls; never a hand-rolled sleep). This is the stall's own
-   signal: it is the call that hangs while the renderer is blocked.
-2. **The compositor presents it** — a configure (`kdotool windowstate --remove MAXIMIZED`, then
-   `--add MAXIMIZED`, then activate/raise) makes KWin re-map and re-draw the window. KWin re-maps
-   it, so the window id is re-resolved after every state change.
-3. **One window, and it is the page's** — match by CLASS (`kdotool search --class google-chrome`),
-   never by a title containing "Chrome": a window's title is its page's title, so a stray window is
-   invisible to a title search.
-4. **Two captures, and assert the SECOND** — the connection that arrives right after the stall is
-   served the buffer the server already held; the next one reads the fresh state. This is a
-   re-measurement after the compositor has had a frame to present, not a sleep.
-
-The desktop session also LOCKS itself after ~4 minutes idle, and the greeter covers everything
-(opencharly/pod-kde-nested#6) — assert `org.freedesktop.ScreenSaver.GetActive` is `false` before
-trusting any frame.
+1. **Assert over the pod's own VNC session recorder** — `vnc: {method: session, action: start,
+   session_id: …, fps: 2}` → an `eventually:` host-side OCR that reads the LAST COMPLETE FRAME of the
+   growing `/tmp/charly-session/<id>/frames.mjpeg` → `action: stop`. The engine re-reads as the
+   recording grows, which is what a viewer's stream actually is.
+2. **Drive first, record after.** Measured: with the recorder running before the VNC click/typing
+   steps, typing stopped reaching the page. Put the recorder after the driving steps.
+3. **Do not "fix" the stall by moving the window.** Measured: un-maximize + re-maximize unsticks the
+   renderer but rewrites Chrome's normal bounds to 913x1034 (the page slides out from under a
+   desktop-centre click), minimize/restore does not unstick at all, and a no-op `windowmove` can
+   cause the stall. The underlying defect is filed as opencharly/pod-kde-vnc-cdp#4.
+4. **The session also LOCKS itself after ~4 minutes idle** and the greeter covers everything
+   (opencharly/pod-kde-nested#6) — assert `org.freedesktop.ScreenSaver.GetActive` is `false`.
 
 ## The pod-to-pod cross-deployment CDP probe (`check-cross-kde-cdp-pod`)
 

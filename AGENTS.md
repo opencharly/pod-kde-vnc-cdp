@@ -34,14 +34,16 @@ Canonical files:
   BEHIND the fullscreen Plasma window (a browser there is invisible), a compositor-driven launch
   races the supervisor, and `--start-maximized` alone is not proof on Wayland. The bed asserts all
   three (browser-side `MAXOK`, compositor-side `kdotool` geometry, and both again after a restart).
-- **A VNC-frame assertion needs its premises, and the SECOND capture.** After the supervised
-  browser's restart cycle, presentation can stall while every metadata check still passes: KWin
-  reports the window's title/geometry/activation and CDP answers, but the capture is a complete,
-  coherent, OLD frame. A renderer view capture (`Page.captureScreenshot`, `fromSurface:false`) is
-  the signal — it hangs while stalled and answers instantly when healthy; a configure
-  (un-maximize + re-maximize) makes the compositor re-present; and the first `vnc: screenshot` after
-  the stall is served the buffer the server held, so assert the capture AFTER it. Details and the
-  measured table: `.agents/skills/kde-vnc-cdp/SKILL.md`.
+- **A VNC-frame assertion is made over the RECORDING, never a single capture.** Measured on this
+  pod: after the browser's restart cycle presentation can stall while every metadata check passes —
+  KWin reports the window's title/geometry/activation and CDP answers, yet a one-shot `vnc: screenshot`
+  returns a complete, coherent, OLD frame (worst case measured: 3m20s stale). Assert with the VNC
+  session recorder (`vnc: {method: session, action: start|stop}`) plus an `eventually:` OCR over the
+  growing `frames.mjpeg`, and run the recorder AFTER the pointer/keyboard steps (a recorder running
+  first was measured to swallow VNC typing). Never try to unstick the browser by un-maximizing or
+  moving its window: that rewrites its normal bounds and moves the page out from under the bed's
+  coordinates. Details: `.agents/skills/kde-vnc-cdp/SKILL.md`; the stall itself is
+  opencharly/pod-kde-vnc-cdp#4.
 - **Input in the bed goes through `vnc:`, never `wl: type` or `wl: click`.** KWin implements none
   of the wlroots input protocols; `plugin-wl` fail-fasts them, and `wtype`'s private keymap is
   re-mapped by the nested KWin so typed text arrives garbled.
