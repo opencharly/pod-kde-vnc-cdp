@@ -83,12 +83,14 @@ Needs a host with a GPU exposed through CDI (the CPU-only sibling to run instead
 | the MCP catalog | `mcp: ping`, `mcp: list-tools` |
 | a REAL external page (CDP surface only) | `cdp: open` `https://example.com/` → `tab: 1` is the page (the close-others step asserts it) → `title`/`text` needles from its live copy → `cdp: screenshot` + host OCR. Its VNC leg is deliberately OUT: measured, the streamed frame stayed stale for 3m20s after the restart cycle (opencharly/pod-kde-vnc-cdp#4), so only the pod's OWN marker page is asserted over the stream |
 
-**Host prerequisites for the OCR steps:** `tesseract` with English data, and `imagemagick`
-(`magick`, used to upscale the 1920x1080 VNC frame 3x before OCR — at native size tesseract reads
-almost nothing off a desktop capture). Both run on the HOST, not in the image, driven from
-host-side `command:` steps because `vnc:` has no `artifact_contains_text`. The marker the VNC frame
-carries is a SINGLE WORD (`CHARLYCDP`): a hyphenated token is the one thing OCR reliably mangles.
-Prove the assertion can fail (a word that is not on screen must go RED) before trusting a green one.
+**Host prerequisite for the OCR steps:** `tesseract` with English data. It runs on the HOST, not in
+the image, driven from a host-side `command:` step because `vnc:` has no `artifact_contains_text`;
+the frame is extracted from the recording (the last complete JPEG) and OCR'd at its native size — one
+marker word in large type reads directly, measured (`bed-vnc-shows-page`: 2 attempts, 10.2 s).
+
+The marker the frame carries is a SINGLE WORD (`CHARLYCDP`): a hyphenated token is the one thing OCR
+reliably mangles. Prove the assertion can fail (a word that is not on screen must go RED) before
+trusting a green one.
 
 The external-page steps need outbound HTTPS from the host's pod network, and they assert the live
 copy of `https://example.com/` — so a proxy, a captive portal, or a cached page fails them by
