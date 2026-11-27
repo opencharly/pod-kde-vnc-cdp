@@ -43,9 +43,9 @@ kde-vnc-cdp-session:
             on exit, and lands as a window the VNC stream shows.
             Every claim is observable: the assembled supervisord entry and the ambient session
             env at build time, and at runtime the RUNNING browser, a KWin client running
-            maximized, every cdp: method answering through the proxy except screenshot, which is a
-            measured GPU-Wayland limit (opencharly/plugin-cdp#14; the VNC frame carries the visual
-            claim), the MCP tool catalog, and
+            maximized, every cdp: method answering through the proxy (the screenshot's artifact read
+            back by OCR, because this GPU Wayland Chrome needs the view fallback), the MCP tool
+            catalog, and
             VNC pointer/keyboard input reaching the browser and visible in the frame.
         require:
             # The desktop: sway + wayvnc + the shared nested Plasma session. pod-kde-vnc is
@@ -329,8 +329,8 @@ check-kde-vnc-cdp-pod:
             # must RETURN a capture within a budget far below the old behaviour. Without the fix the
             # surface capture never returns and this step dies on the per-attempt never-hang bound;
             # with it, the surface attempt is abandoned after 20s and the view capture lands a PNG.
-            # (The frame it lands is blank on this GPU Wayland Chrome — opencharly/plugin-cdp#14 —
-            # so CONTENT is not asserted here; the pod's visual claim is the VNC frame + OCR.)
+            # The artifact's CONTENT is asserted by OCR below: `artifact_not_uniform` samples 100
+            # pixels at a fixed stride and a mostly-white page fools it (opencharly/plugin-cdp#14).
             - check: "cdp: screenshot returns a capture within the budget instead of hanging"
               id: bed-cdp-screenshot
               context: [runtime]
@@ -341,6 +341,21 @@ check-kde-vnc-cdp-pod:
                   artifact: /tmp/check-kde-vnc-cdp-page.png
                   artifact_min_bytes: 5000
                   artifact_min_dimensions: 400x300
+            # `artifact_not_uniform` is the WRONG instrument for this page: it samples 100 pixels at a
+            # fixed stride, and a mostly-white page with one headline can be uniformly white at every
+            # sample point while the capture is perfectly good (RGBA=255,255,255,255 was reported for
+            # a page whose text CDP could read). OCR reads the artifact's CONTENT instead.
+            - check: the captured PNG carries the page's own text — host-side OCR of the CDP artifact
+              id: bed-cdp-screenshot-content
+              context: [runtime]
+              timeout: 120s
+              exit_status: 0
+              stdout:
+                  - contains: charly
+              command:
+                  command: |
+                      tesseract /tmp/check-kde-vnc-cdp-page.png - --psm 11 2>/dev/null | tr -s ' ' ' ' | tr 'A-Z' 'a-z' | grep -E -m1 'charly'
+                  in_container: false
             - check: "cdp: wait resolves a selector that is present"
               id: bed-cdp-wait
               context: [runtime]
@@ -360,13 +375,8 @@ check-kde-vnc-cdp-pod:
               exit_status: 0
               stdout:
                   - contains: product
-            # `cdp: screenshot` is NOT asserted on this pod, and that is a measured limit, not an
-            # omission: on this GPU Wayland Chrome the surface capture never returns and the
-            # plugin's renderer-view fallback comes back uniformly white EVERY time (4/4 attempts,
-            # 99s; opencharly/plugin-cdp#14). Polling cannot fix a capture that is blank by
-            # construction, and the repeated capture attempts also disturb the page the OCR step
-            # below reads. The visual claim is therefore carried by the VNC frame — what the
-            # streamed user actually SEES — captured with `vnc:` and read by host OCR.
+            # The visual claim is carried by BOTH: the CDP artifact OCR'd above (the browser's own
+            # page) and the VNC frame below (what the streamed user sees).
             - check: "cdp: click clicks a selector and the page reacts"
               id: bed-cdp-click
               context: [runtime]
@@ -497,31 +507,10 @@ check-kde-vnc-cdp-pod:
                       test -n "$w" && test -n "$h" || { echo "no geometry parsed from: $geo" >&2; exit 1; }
                       test "$w" -ge 1800 && test "$h" -ge 1000 && echo "geometry ok: ${w}x${h}" || { echo "not maximized: ${w}x${h}" >&2; exit 1; }
                   in_container: true
-            - check: the VNC framebuffer is captured host-side for the OCR assertion
-              id: bed-vnc-frame-for-ocr
-              context: [runtime]
-              timeout: 120s
-              vnc:
-                  method: screenshot
-                  artifact: /tmp/check-kde-vnc-cdp-ocr.png
-                  artifact_min_dimensions: 1920x1080
-                  artifact_not_uniform: true
             # The frame is read by the host's OCR engine in a host-side command: the `vnc:` verb
             # does not carry `artifact_contains_text` (measured: "#VncInput.artifact_contains_text:
             # field not allowed"), so the same instrument is driven explicitly over the captured
             # desktop instead of being unavailable.
-            - check: the STREAMED FRAME shows the page's own text — OCR of the captured desktop, not of the browser's own screenshot
-              id: bed-vnc-shows-page
-              context: [runtime]
-              timeout: 120s
-              exit_status: 0
-              stdout:
-                  - contains: HARLY
-              command:
-                  command: |
-                      tesseract /tmp/check-kde-vnc-cdp-ocr.png - --psm 11 2>/dev/null | tr -s ' ' ' ' | grep -Ei -m1 'charly[^a-z]*cdp'
-                  in_container: false
-
             # --- DRIVE it over VNC: pointer + keyboard reach the browser --------------------
             # The maximized window covers the screen centre (asserted above), so a click at the
             # centre is inside the page's body — no coordinate chaining between steps (the check
@@ -765,6 +754,168 @@ check-kde-vnc-cdp-pod:
               file:
                   file: /tmp/kde-vnc-cdp-input-ok
                   exists: true
+            # A SINGLE capture is not evidence of what the streamed user sees: measured on this pod,
+            # presentation can stall for tens of seconds after the browser's restart cycle while
+            # every window/title/activation check still passes, and the one-shot capture then holds
+            # an arbitrarily old buffer. The pod's own VNC session recorder captures continuously,
+            # so the assertion is made over the RECORDING and re-read as it grows (the engine's
+            # `eventually:`), which is what a viewer's stream actually is.
+            # A locked session is a THIRD way the frame can be right about everything else and still
+            # show nothing useful: Plasma's greeter covers the desktop. Measured while this probe was
+            # being written — a pod left idle ~4 minutes locked itself and the frame was the greeter,
+            # which no dbus SetActive call clears. So the frame's premise is asserted, not assumed.
+            - check: "the streamed session is NOT screen-locked, so the recorded frame can show the desktop"
+              id: bed-session-unlocked
+              context: [runtime]
+              timeout: 60s
+              exit_status: 0
+              command:
+                  command: |
+                      active=$(DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/dbus-session \
+                        dbus-send --session --print-reply --dest=org.freedesktop.ScreenSaver \
+                        /ScreenSaver org.freedesktop.ScreenSaver.GetActive 2>&1 | sed -n 's/.*boolean //p')
+                      echo "screen locked: $active"
+                      [ "$active" = "false" ] || { echo "the session is screen-locked; the streamed frame would show the greeter, not the page"; exit 1; }
+                  in_container: true
+              stdout:
+                  - contains: "screen locked: false"
+            - check: the VNC session recorder starts, capturing the streamed desktop
+              id: bed-vnc-record-start
+              context: [runtime]
+              timeout: 60s
+              vnc:
+                  method: session
+                  action: start
+                  session_id: kde-marker
+                  fps: 2
+              stdout:
+                  - contains: started
+            - check: the STREAMED FRAME shows the page's own text — OCR of the recorded desktop stream
+              id: bed-vnc-shows-page
+              context: [runtime]
+              timeout: 240s
+              eventually: 150s
+              retry_interval: 10s
+              exit_status: 0
+              stdout:
+                  - contains: charly
+              command:
+                  command: |
+                      python3 - <<'PYEOF'
+                      d = open("/tmp/charly-session/kde-marker/frames.mjpeg", "rb").read()
+                      e = d.rfind(b"\xff\xd9")
+                      s = d.rfind(b"\xff\xd8", 0, e)
+                      open("/tmp/kde-marker-last.jpg", "wb").write(d[s:e+2] if s >= 0 and e > s else b"")
+                      PYEOF
+                      tesseract /tmp/kde-marker-last.jpg - --psm 11 2>/dev/null | tr -s ' ' ' ' | tr 'A-Z' 'a-z' | grep -E -m1 'charly'
+                  in_container: false
+            - check: the VNC session recorder stops
+              id: bed-vnc-record-stop
+              context: [runtime]
+              timeout: 60s
+              vnc:
+                  method: session
+                  action: stop
+                  session_id: kde-marker
+              exit_status: 0
+
+            # A REAL external page, both capture surfaces, both OCR'd. This is the end-to-end browser
+            # proof the pod exists for — the browser fetches a public site through the pod's egress,
+            # CDP reads it, and each capture's CONTENT is read back by OCR. PREREQUISITE: the host's
+            # pod network has outbound HTTPS; a failure here names egress, not the pod's internals.
+            - check: "the browser opens https://example.com/ in a NEW tab (real egress)"
+              id: probe-example-open
+              context: [runtime]
+              timeout: 60s
+              cdp:
+                  method: open
+                  url: https://example.com/
+              exit_status: 0
+              stdout:
+                  - contains: "Opened https://example.com/"
+            - check: "tab 1 is the tab the browser just opened (so the rest of the probe addresses it)"
+              id: probe-example-tab1
+              context: [runtime]
+              cdp:
+                  method: eval
+                  tab: "1"
+                  expression: location.href
+              stdout:
+                  - contains: example.com
+            - check: "the external page really loaded — its CDP title is Example Domain"
+              id: probe-example-title
+              context: [runtime]
+              timeout: 90s
+              eventually: 60s
+              retry_interval: 5s
+              cdp:
+                  method: eval
+                  tab: "1"
+                  expression: document.title
+              stdout:
+                  - contains: Example Domain
+            - check: "the page body is example.com's live copy, not a cached or error page"
+              id: probe-example-text
+              context: [runtime]
+              cdp:
+                  method: text
+                  tab: "1"
+              stdout:
+                  - contains: "for use in documentation examples without needing permission"
+                  - contains: "This is not a service"
+            - check: "a CDP screenshot of the external page is captured"
+              id: probe-example-cdp-shot
+              context: [runtime]
+              timeout: 240s
+              cdp:
+                  method: screenshot
+                  tab: "1"
+                  artifact: /tmp/probe-example-cdp.png
+                  artifact_min_bytes: 10000
+                  artifact_min_dimensions: 800x600
+            - check: "OCR reads the external page's live text out of the CDP capture"
+              id: probe-example-cdp-ocr
+              context: [runtime]
+              timeout: 120s
+              exit_status: 0
+              stdout:
+                  - contains: documentation examples
+              command:
+                  command: |
+                      tesseract /tmp/probe-example-cdp.png - --psm 11 2>/dev/null | tr -s ' ' ' ' | grep -Ei -m1 'documentation examples'
+                  in_container: false
+            # The page must be the ONLY page the browser has open. Two earlier rounds captured a
+            # New Tab instead of the page: Chrome held a second window (a session-restored one) and
+            # neither `Page.bringToFront` nor an activation could make the captured surface show the
+            # page, because the compositor was rendering a different window. One tab leaves exactly
+            # one window, and closing the others is the explicit setup the claim needs — not a retry.
+            - check: "every OTHER browser tab is closed, so the page is the only page left"
+              id: probe-example-only-tab
+              context: [runtime]
+              timeout: 60s
+              exit_status: 0
+              command:
+                  command: |
+                      node --input-type=module -e '
+                        const pages = (await (await fetch("http://127.0.0.1:9222/json")).json()).filter(t => t.type === "page");
+                        const idx = pages.findIndex(p => p.url.includes("example.com"));
+                        if (idx < 0) {
+                          console.error("no example.com tab among: " + pages.map(p => p.url).join(" | "));
+                          process.exit(1);
+                        }
+                        // Later steps address the page as `tab: "1"` — the NEWEST page target — so the
+                        // page must be first; asserted rather than assumed.
+                        if (idx !== 0) {
+                          console.error("the page tab is at index " + idx + ", not 1; `tab: 1` would address another page");
+                          process.exit(1);
+                        }
+                        const keep = pages[0];
+                        for (const p of pages.slice(1)) await fetch("http://127.0.0.1:9222/json/close/" + p.id);
+                        console.log("kept " + keep.url + " — closed " + (pages.length - 1) + " other tab(s)");
+                      '
+                  in_container: true
+              stdout:
+                  - contains: "kept https://example.com/"
             - agent-check: the streamed frame shows a fullscreen KDE Plasma desktop with a maximized Chrome window (title bar and page visible), not a black or gray frame
 
 kde-web-subject:
