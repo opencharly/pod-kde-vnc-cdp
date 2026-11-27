@@ -26,11 +26,11 @@ import:
     # (kdotool, via layer-kde-shell, is an AUR package; chrome-devtools-mcp needs npm + pixi).
     # These are the same pins pod-kde-vnc uses, so the pod this repo composes and the base it
     # sits on are built from one generation.
-    - arch: '@github.com/opencharly/distro-arch:v2026.326.1455'
-    - podcdi: '@github.com/opencharly/pod-cdi:v2026.326.1530'
+    - arch: '@github.com/opencharly/distro-arch:v2026.330.1808'
+    - podcdi: '@github.com/opencharly/pod-cdi:v2026.330.1230'
     # The CachyOS base for the cross-deployment SUBJECT. The KDE pod itself sits on pod-cdi
     # (it needs the GPU); a web fixture must not, so the subject takes the plain CachyOS base.
-    - cachyos: '@github.com/opencharly/distro-cachyos:v2026.330.1249'
+    - cachyos: '@github.com/opencharly/distro-cachyos:v2026.331.0903'
 
 kde-vnc-cdp-session:
     candy:
@@ -48,14 +48,18 @@ kde-vnc-cdp-session:
             catalog, and
             VNC pointer/keyboard input reaching the browser and visible in the frame.
         require:
-            # The desktop: sway + wayvnc + the shared nested Plasma session. pod-kde-vnc is
-            # ARCHIVED (umbrella#1295 retired the desktop closure with "no replacement"), so the
-            # pin is deliberate and the two corrections this pod needs from that closure live HERE
-            # rather than upstream — see the helpers below.
-            # v2026.330.1628 is the release that sets the image's session pair
-            # (WAYLAND_DISPLAY=wayland-kde, KDE_SESSION_VERSION=6, opencharly/pod-kde-vnc#7), so
-            # this pod no longer carries a copy of it.
-            - '@github.com/opencharly/pod-kde-vnc:v2026.330.1628'
+            # The desktop: sway + wayvnc + the shared nested Plasma session. pod-kde-vnc is a
+            # LIVE repo (umbrella#1295 had retired the desktop closure; the KDE pods were
+            # restored and re-added, and this pod pins a MERGED tag of it by the ordinary
+            # producer-first order — no local copy of any of its behaviour lives here).
+            # v2026.330.1628 set the image's session pair (WAYLAND_DISPLAY=wayland-kde,
+            # KDE_SESSION_VERSION=6, opencharly/pod-kde-vnc#7), so this pod no longer carries a
+            # copy of it. v2026.331.1657 advances the leaves that pair sits on — pod-kde-nested
+            # v2026.331.1638 (the release that stops the nested session locking itself,
+            # opencharly/pod-kde-nested#6/#7), pod-sway v2026.328.1647, plugin-vnc v2026.331.1105
+            # (artifact_contains_text) — so this pod runs the desktop generation the unlock
+            # behaviour was proved on.
+            - '@github.com/opencharly/pod-kde-vnc:v2026.331.1657'
             # The CDP toolkit: chrome-wrapper, cdp-proxy (9222), browser-open, chrome-restart,
             # the chrome-windows extension, BROWSER/BROWSER_CDP_URL, and the composed
             # chrome-devtools-mcp (9224). Container-only, like every feature it installs.
@@ -65,8 +69,8 @@ kde-vnc-cdp-session:
             - '@github.com/opencharly/pod-chrome-cdp:v2026.330.1834'
             # plugin-cdp serves the `cdp:` check verb. Pinned to the release that fixes `close`'s tab
             # resolution and bounds the screenshot's surface capture (opencharly/plugin-cdp#15):
-            # the archived pod-chrome-cdp pin above names a release older than both, and this pin is
-            # the one the project's plugin set resolves.
+            # the pod-chrome-cdp release above still names plugin-cdp v2026.271.2310, older than
+            # both, and this pin is the one this project's plugin set resolves.
             - '@github.com/opencharly/plugin-cdp/candy/plugin-cdp:v2026.330.1608'
         service:
             # Chrome is SUPERVISED, not launched from a compositor's config: this pod's desktop
