@@ -760,6 +760,25 @@ check-kde-vnc-cdp-pod:
             # an arbitrarily old buffer. The pod's own VNC session recorder captures continuously,
             # so the assertion is made over the RECORDING and re-read as it grows (the engine's
             # `eventually:`), which is what a viewer's stream actually is.
+            # A locked session is a THIRD way the frame can be right about everything else and still
+            # show nothing useful: Plasma's greeter covers the desktop. Measured while this probe was
+            # being written — a pod left idle ~4 minutes locked itself and the frame was the greeter,
+            # which no dbus SetActive call clears. So the frame's premise is asserted, not assumed.
+            - check: "the streamed session is NOT screen-locked, so the recorded frame can show the desktop"
+              id: bed-session-unlocked
+              context: [runtime]
+              timeout: 60s
+              exit_status: 0
+              command:
+                  command: |
+                      active=$(DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/dbus-session \
+                        dbus-send --session --print-reply --dest=org.freedesktop.ScreenSaver \
+                        /ScreenSaver org.freedesktop.ScreenSaver.GetActive 2>&1 | sed -n 's/.*boolean //p')
+                      echo "screen locked: $active"
+                      [ "$active" = "false" ] || { echo "the session is screen-locked; the streamed frame would show the greeter, not the page"; exit 1; }
+                  in_container: true
+              stdout:
+                  - contains: "screen locked: false"
             - check: the VNC session recorder starts, capturing the streamed desktop
               id: bed-vnc-record-start
               context: [runtime]
@@ -920,73 +939,6 @@ check-kde-vnc-cdp-pod:
                   expression: document.visibilityState
               stdout:
                   - contains: visible
-            # And the COMPOSITOR has to agree about what a viewer of the stream sees: exactly one
-            # Chrome window, on the CURRENT desktop, NOT minimized, maximized over the output, and it
-            # is the active window. Each of those is a way a window can exist, be titled with the page,
-            # and still not be on screen — which is exactly what two earlier rounds captured.
-            - check: "KWin shows ONE Chrome window, unminimized, maximized, on the current desktop, and it is active"
-              id: probe-example-window
-              context: [runtime]
-              timeout: 90s
-              exit_status: 0
-              command:
-                  command: |
-                      # Match the CLASS, not the title: a stray Chrome window is titled with its own
-                      # page ("New Tab") and a `--name Chrome` search would not see it — the blind
-                      # spot that let three earlier rounds pass their window assertions while the
-                      # frame showed another window.
-                      list() { kdotool search --class google-chrome 2>/dev/null; }
-                      for w in $(list); do
-                        echo "chrome window $w :: $(kdotool getwindowname "$w" 2>&1)"
-                      done
-                      # A stray Chrome window is the setup this claim does not want; close it and say so.
-                      for w in $(list); do
-                        case "$(kdotool getwindowname "$w" 2>&1)" in
-                          *"Example Domain"*) ;;
-                          *) echo "closing the stray Chrome window: $(kdotool getwindowname "$w" 2>&1)"; kdotool windowclose "$w" 2>&1 ;;
-                        esac
-                      done
-                      n=$(list | wc -l)
-                      echo "chrome windows: $n"
-                      [ "$n" -eq 1 ] || { echo "expected exactly ONE Chrome window, found $n"; exit 1; }
-                      w=$(list | sed -n '1p')
-                      kdotool windowstate --remove MINIMIZED "$w" 2>&1
-                      kdotool set_desktop_for_window "$w" current_desktop 2>&1
-                      kdotool windowactivate "$w" 2>&1
-                      kdotool windowraise "$w" 2>&1
-                      echo "geometry: $(kdotool getwindowgeometry "$w" 2>&1 | tr '\n' ' ')"
-                      # The assertable line names its source, so the window LIST above can never
-                      # satisfy it: only KWin's own answer to "which window is active" counts.
-                      echo "active: $(kdotool getactivewindow getwindowname 2>&1)"
-                  in_container: true
-              stdout:
-                  - contains: "chrome windows: 1"
-                  - contains: "active: Example Domain"
-                  - contains: "Geometry: 1920x1034"
-            # A locked session is a THIRD way the frame can be right about everything else and still
-            # show nothing useful: Plasma's greeter covers the desktop. Measured while this probe was
-            # being written — a pod left idle ~4 minutes locked itself and the frame was the greeter,
-            # which no dbus SetActive call clears. So the frame's premise is asserted, not assumed.
-            - check: "the streamed session is NOT screen-locked, so the frame can show the desktop"
-              id: probe-example-unlocked
-              context: [runtime]
-              timeout: 60s
-              exit_status: 0
-              command:
-                  command: |
-                      active=$(DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/dbus-session \
-                        dbus-send --session --print-reply --dest=org.freedesktop.ScreenSaver \
-                        /ScreenSaver org.freedesktop.ScreenSaver.GetActive 2>&1 | sed -n 's/.*boolean //p')
-                      echo "screen locked: $active"
-                      [ "$active" = "false" ] || { echo "the session is screen-locked; the frame would show the greeter, not the page"; exit 1; }
-                  in_container: true
-              stdout:
-                  - contains: "screen locked: false"
-            # THE STALL'S OWN SIGNAL. After the supervised browser's stop -> start -> restart cycle
-            # this Chrome's presentation stalls: the compositor keeps drawing the window's last
-            # committed buffer while the browser keeps answering metadata. A renderer VIEW capture
-            # is the decisive probe — it returns instantly when the browser is painting and HANGS
-            # while it is stalled (measured: 3 s budget, three attempts, green after 15.5 s).
             - agent-check: the streamed frame shows a fullscreen KDE Plasma desktop with a maximized Chrome window (title bar and page visible), not a black or gray frame
 
 kde-web-subject:

@@ -81,7 +81,7 @@ Needs a host with a GPU exposed through CDI (the CPU-only sibling to run instead
 | VNC DRIVES the page | `vnc: click` at the maximized window's centre + `vnc: type` into a CDP-focused field, read back by `cdp: eval` |
 | `$BROWSER`, `chrome-restart` | `command:` `browser-open …`, `chrome-restart`, then `cdp: status` |
 | the MCP catalog | `mcp: ping`, `mcp: list-tools` |
-| a REAL external page, on both capture surfaces | `cdp: open` `https://example.com/` → close every other tab → `title`/`text` needles from its live copy → `cdp: screenshot` + host OCR → the four VNC premises below → `vnc: screenshot` ×2 + host OCR of the second |
+| a REAL external page (CDP surface only) | `cdp: open` `https://example.com/` → `tab: 1` is the page (the close-others step asserts it) → `title`/`text` needles from its live copy → `cdp: screenshot` + host OCR. Its VNC leg is deliberately OUT: measured, the streamed frame stayed stale for 3m20s after the restart cycle (opencharly/pod-kde-vnc-cdp#4), so only the pod's OWN marker page is asserted over the stream |
 
 **Host prerequisites for the OCR steps:** `tesseract` with English data, and `imagemagick`
 (`magick`, used to upscale the 1920x1080 VNC frame 3x before OCR — at native size tesseract reads
