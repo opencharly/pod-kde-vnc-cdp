@@ -43,9 +43,9 @@ kde-vnc-cdp-session:
             on exit, and lands as a window the VNC stream shows.
             Every claim is observable: the assembled supervisord entry and the ambient session
             env at build time, and at runtime the RUNNING browser, a KWin client running
-            maximized, every cdp: method answering through the proxy except screenshot, which is a
-            measured GPU-Wayland limit (opencharly/plugin-cdp#14; the VNC frame carries the visual
-            claim), the MCP tool catalog, and
+            maximized, every cdp: method answering through the proxy (the screenshot's artifact read
+            back by OCR, because this GPU Wayland Chrome needs the view fallback), the MCP tool
+            catalog, and
             VNC pointer/keyboard input reaching the browser and visible in the frame.
         require:
             # The desktop: sway + wayvnc + the shared nested Plasma session. pod-kde-vnc is
@@ -329,8 +329,8 @@ check-kde-vnc-cdp-pod:
             # must RETURN a capture within a budget far below the old behaviour. Without the fix the
             # surface capture never returns and this step dies on the per-attempt never-hang bound;
             # with it, the surface attempt is abandoned after 20s and the view capture lands a PNG.
-            # (The frame it lands is blank on this GPU Wayland Chrome — opencharly/plugin-cdp#14 —
-            # so CONTENT is not asserted here; the pod's visual claim is the VNC frame + OCR.)
+            # The artifact's CONTENT is asserted by OCR below: `artifact_not_uniform` samples 100
+            # pixels at a fixed stride and a mostly-white page fools it (opencharly/plugin-cdp#14).
             - check: "cdp: screenshot returns a capture within the budget instead of hanging"
               id: bed-cdp-screenshot
               context: [runtime]
@@ -341,6 +341,21 @@ check-kde-vnc-cdp-pod:
                   artifact: /tmp/check-kde-vnc-cdp-page.png
                   artifact_min_bytes: 5000
                   artifact_min_dimensions: 400x300
+            # `artifact_not_uniform` is the WRONG instrument for this page: it samples 100 pixels at a
+            # fixed stride, and a mostly-white page with one headline can be uniformly white at every
+            # sample point while the capture is perfectly good (RGBA=255,255,255,255 was reported for
+            # a page whose text CDP could read). OCR reads the artifact's CONTENT instead.
+            - check: the captured PNG carries the page's own text — host-side OCR of the CDP artifact
+              id: bed-cdp-screenshot-content
+              context: [runtime]
+              timeout: 120s
+              exit_status: 0
+              stdout:
+                  - contains: HARLY
+              command:
+                  command: |
+                      tesseract /tmp/check-kde-vnc-cdp-page.png - --psm 11 2>/dev/null | tr -s ' ' ' ' | grep -Ei -m1 'charly'
+                  in_container: false
             - check: "cdp: wait resolves a selector that is present"
               id: bed-cdp-wait
               context: [runtime]
@@ -360,13 +375,8 @@ check-kde-vnc-cdp-pod:
               exit_status: 0
               stdout:
                   - contains: product
-            # `cdp: screenshot` is NOT asserted on this pod, and that is a measured limit, not an
-            # omission: on this GPU Wayland Chrome the surface capture never returns and the
-            # plugin's renderer-view fallback comes back uniformly white EVERY time (4/4 attempts,
-            # 99s; opencharly/plugin-cdp#14). Polling cannot fix a capture that is blank by
-            # construction, and the repeated capture attempts also disturb the page the OCR step
-            # below reads. The visual claim is therefore carried by the VNC frame — what the
-            # streamed user actually SEES — captured with `vnc:` and read by host OCR.
+            # The visual claim is carried by BOTH: the CDP artifact OCR'd above (the browser's own
+            # page) and the VNC frame below (what the streamed user sees).
             - check: "cdp: click clicks a selector and the page reacts"
               id: bed-cdp-click
               context: [runtime]
@@ -765,6 +775,286 @@ check-kde-vnc-cdp-pod:
               file:
                   file: /tmp/kde-vnc-cdp-input-ok
                   exists: true
+            # A REAL external page, both capture surfaces, both OCR'd. This is the end-to-end browser
+            # proof the pod exists for — the browser fetches a public site through the pod's egress,
+            # CDP reads it, and each capture's CONTENT is read back by OCR. PREREQUISITE: the host's
+            # pod network has outbound HTTPS; a failure here names egress, not the pod's internals.
+            - check: "the browser opens https://example.com/ in a NEW tab (real egress)"
+              id: probe-example-open
+              context: [runtime]
+              timeout: 60s
+              cdp:
+                  method: open
+                  url: https://example.com/
+              exit_status: 0
+              stdout:
+                  - contains: "Opened https://example.com/"
+            - check: "tab 1 is the tab the browser just opened (so the rest of the probe addresses it)"
+              id: probe-example-tab1
+              context: [runtime]
+              cdp:
+                  method: eval
+                  tab: "1"
+                  expression: location.href
+              stdout:
+                  - contains: example.com
+            - check: "the external page really loaded — its CDP title is Example Domain"
+              id: probe-example-title
+              context: [runtime]
+              timeout: 90s
+              eventually: 60s
+              retry_interval: 5s
+              cdp:
+                  method: eval
+                  tab: "1"
+                  expression: document.title
+              stdout:
+                  - contains: Example Domain
+            - check: "the page body is example.com's live copy, not a cached or error page"
+              id: probe-example-text
+              context: [runtime]
+              cdp:
+                  method: text
+                  tab: "1"
+              stdout:
+                  - contains: "for use in documentation examples without needing permission"
+                  - contains: "This is not a service"
+            - check: "a CDP screenshot of the external page is captured"
+              id: probe-example-cdp-shot
+              context: [runtime]
+              timeout: 240s
+              cdp:
+                  method: screenshot
+                  tab: "1"
+                  artifact: /tmp/probe-example-cdp.png
+                  artifact_min_bytes: 10000
+                  artifact_min_dimensions: 800x600
+            - check: "OCR reads the external page's live text out of the CDP capture"
+              id: probe-example-cdp-ocr
+              context: [runtime]
+              timeout: 120s
+              exit_status: 0
+              stdout:
+                  - contains: documentation examples
+              command:
+                  command: |
+                      tesseract /tmp/probe-example-cdp.png - --psm 11 2>/dev/null | tr -s ' ' ' ' | grep -Ei -m1 'documentation examples'
+                  in_container: false
+            # The page must be the ONLY page the browser has open. Two earlier rounds captured a
+            # New Tab instead of the page: Chrome held a second window (a session-restored one) and
+            # neither `Page.bringToFront` nor an activation could make the captured surface show the
+            # page, because the compositor was rendering a different window. One tab leaves exactly
+            # one window, and closing the others is the explicit setup the claim needs — not a retry.
+            - check: "every OTHER browser tab is closed, so the page is the only page left"
+              id: probe-example-only-tab
+              context: [runtime]
+              timeout: 60s
+              exit_status: 0
+              command:
+                  command: |
+                      node --input-type=module -e '
+                        const pages = (await (await fetch("http://127.0.0.1:9222/json")).json()).filter(t => t.type === "page");
+                        const keep = pages[0];
+                        if (!keep || !keep.url.includes("example.com")) {
+                          console.error("the newest tab is not the page: " + (keep && keep.url));
+                          process.exit(1);
+                        }
+                        for (const p of pages.slice(1)) await fetch("http://127.0.0.1:9222/json/close/" + p.id);
+                        console.log("kept " + keep.url + " — closed " + (pages.length - 1) + " other tab(s)");
+                      '
+                  in_container: true
+              stdout:
+                  - contains: "kept https://example.com/"
+            - check: "the tab is brought to the front (CDP tab activation)"
+              id: probe-example-front
+              context: [runtime]
+              exit_status: 0
+              cdp:
+                  method: raw
+                  tab: "1"
+                  http_method: Page.bringToFront
+                  params: "{}"
+            # Two premises stand between "the browser fetched the page" and "the frame shows it", and
+            # each needs its own assertion: the page must be its window's ACTIVE tab (a background tab
+            # reports visibilityState hidden), and that window must be the one the compositor shows.
+            - check: "the page is its window's ACTIVE tab (document.visibilityState is visible)"
+              id: probe-example-active-tab
+              context: [runtime]
+              eventually: 30s
+              retry_interval: 2s
+              cdp:
+                  method: eval
+                  tab: "1"
+                  expression: document.visibilityState
+              stdout:
+                  - contains: visible
+            # And the COMPOSITOR has to agree about what a viewer of the stream sees: exactly one
+            # Chrome window, on the CURRENT desktop, NOT minimized, maximized over the output, and it
+            # is the active window. Each of those is a way a window can exist, be titled with the page,
+            # and still not be on screen — which is exactly what two earlier rounds captured.
+            - check: "KWin shows ONE Chrome window, unminimized, maximized, on the current desktop and active"
+              id: probe-example-window
+              context: [runtime]
+              timeout: 90s
+              exit_status: 0
+              command:
+                  command: |
+                      # Match the CLASS, not the title: a stray Chrome window is titled with its own
+                      # page ("New Tab") and a `--name Chrome` search would not see it — the blind
+                      # spot that let three earlier rounds pass their window assertions while the
+                      # frame showed another window.
+                      list() { kdotool search --class google-chrome 2>/dev/null; }
+                      for w in $(list); do
+                        echo "chrome window $w :: $(kdotool getwindowname "$w" 2>&1)"
+                      done
+                      # A stray Chrome window is the setup this claim does not want; close it and say so.
+                      for w in $(list); do
+                        case "$(kdotool getwindowname "$w" 2>&1)" in
+                          *"Example Domain"*) ;;
+                          *) echo "closing the stray Chrome window: $(kdotool getwindowname "$w" 2>&1)"; kdotool windowclose "$w" 2>&1 ;;
+                        esac
+                      done
+                      n=$(list | wc -l)
+                      echo "chrome windows: $n"
+                      [ "$n" -eq 1 ] || { echo "expected exactly ONE Chrome window, found $n"; exit 1; }
+                      page() { kdotool search --name 'Example Domain' 2>/dev/null | sed -n '1p'; }
+
+                      # THE FRESHNESS STEP (measured, not cosmetic). After the supervised browser's
+                      # stop -> start -> restart cycle this Chrome's Wayland PRESENTATION stalls: the
+                      # compositor keeps re-drawing the window's last committed buffer (the New Tab
+                      # frame), the browser keeps updating its title and target list, and
+                      # `Page.captureScreenshot` with `fromSurface:false` — the path that normally
+                      # returns a view instantly — HANGS. So the window is alive, titled and active
+                      # while the screen shows an arbitrarily old frame. A CONFIGURE from the
+                      # compositor makes Chrome re-allocate and commit: un-maximizing and
+                      # re-maximizing it is that configure, and it is what a user does when a window
+                      # looks stuck. KWin re-maps the window here, so the id is re-resolved after
+                      # each state change — an id from before it no longer names the window.
+                      w=$(page)
+                      [ -n "$w" ] || { echo "no Chrome window is titled with the page"; exit 1; }
+                      kdotool windowstate --remove MINIMIZED "$w" 2>&1
+                      kdotool windowstate --remove MAXIMIZED "$w" 2>&1
+                      w=$(page); [ -n "$w" ] || { echo "the page window vanished on un-maximize"; exit 1; }
+                      kdotool windowstate --add MAXIMIZED "$w" 2>&1
+                      w=$(page); [ -n "$w" ] || { echo "the page window vanished on re-maximize"; exit 1; }
+
+                      kdotool set_desktop_for_window "$w" current_desktop 2>&1
+                      kdotool windowactivate "$w" 2>&1
+                      kdotool windowraise "$w" 2>&1
+                      echo "geometry: $(kdotool getwindowgeometry "$w" 2>&1 | tr '\n' ' ')"
+                      # The assertable line names its source, so the window LIST above can never
+                      # satisfy it: only KWin's own answer to "which window is active" counts.
+                      echo "active: $(kdotool getactivewindow getwindowname 2>&1)"
+                  in_container: true
+              stdout:
+                  - contains: "chrome windows: 1"
+                  - contains: "active: Example Domain"
+                  - contains: "Geometry: 1920x1034"
+            # A locked session is a THIRD way the frame can be right about everything else and still
+            # show nothing useful: Plasma's greeter covers the desktop. Measured while this probe was
+            # being written — a pod left idle ~4 minutes locked itself and the frame was the greeter,
+            # which no dbus SetActive call clears. So the frame's premise is asserted, not assumed.
+            - check: "the streamed session is NOT screen-locked, so the frame can show the desktop"
+              id: probe-example-unlocked
+              context: [runtime]
+              timeout: 60s
+              exit_status: 0
+              command:
+                  command: |
+                      active=$(DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/dbus-session \
+                        dbus-send --session --print-reply --dest=org.freedesktop.ScreenSaver \
+                        /ScreenSaver org.freedesktop.ScreenSaver.GetActive 2>&1 | sed -n 's/.*boolean //p')
+                      echo "screen locked: $active"
+                      [ "$active" = "false" ] || { echo "the session is screen-locked; the frame would show the greeter, not the page"; exit 1; }
+                  in_container: true
+              stdout:
+                  - contains: "screen locked: false"
+            # THE STALL'S OWN SIGNAL. After the supervised browser's stop -> start -> restart cycle
+            # this Chrome's presentation stalls: the compositor keeps drawing the window's last
+            # committed buffer while the browser keeps answering metadata. A renderer VIEW capture
+            # is the decisive probe — it returns instantly when the browser is painting and HANGS
+            # while it is stalled (measured: 3 s budget, three attempts, green after 15.5 s).
+            - check: "the browser is PAINTING again — a view capture answers within the budget"
+              id: probe-example-repaint
+              context: [runtime]
+              timeout: 120s
+              eventually: 90s
+              retry_interval: 3s
+              exit_status: 0
+              stdout:
+                  - contains: renderer answering
+              command:
+                  command: |
+                      node --input-type=module -e '
+                        const base = "http://127.0.0.1:9222";
+                        const pages = (await (await fetch(base + "/json")).json()).filter(t => t.type === "page");
+                        const t = pages.find(p => p.url.includes("example.com"));
+                        if (!t) { console.error("no page target"); process.exit(2); }
+                        const ws = new WebSocket(t.webSocketDebuggerUrl);
+                        await new Promise(r => ws.onopen = r);
+                        const reply = new Promise(r => { ws.onmessage = m => { const d = JSON.parse(m.data); if (d.id === 1) r(d); }; });
+                        ws.send(JSON.stringify({id: 1, method: "Page.captureScreenshot", params: {format: "png", fromSurface: false}}));
+                        const timer = new Promise(r => setTimeout(() => r(null), 3000));
+                        const out = await Promise.race([reply, timer]);
+                        ws.close();
+                        if (!out) { console.log("renderer stalled: no view capture within 3s"); process.exit(1); }
+                        console.log("renderer answering (" + (out.result && out.result.data ? out.result.data.length : 0) + " b64 chars)");
+                      '
+                  in_container: true
+            # …and the COMPOSITOR has to present that frame. A configure (un-maximize, re-maximize)
+            # is what makes KWin re-map and re-draw the window — the same thing a user does to a
+            # window that looks stuck. KWin re-maps it, so the id is re-resolved at each step.
+            - check: "the compositor re-presents the window (configure: un-maximize, re-maximize, activate)"
+              id: probe-example-present
+              context: [runtime]
+              timeout: 90s
+              exit_status: 0
+              command:
+                  command: |
+                      page() { kdotool search --name 'Example Domain' 2>/dev/null | sed -n '1p'; }
+                      w=$(page); [ -n "$w" ] || { echo "no page window"; exit 1; }
+                      kdotool windowstate --remove MAXIMIZED "$w" 2>&1
+                      w=$(page); [ -n "$w" ] || { echo "the page window vanished on un-maximize"; exit 1; }
+                      kdotool windowstate --add MAXIMIZED "$w" 2>&1
+                      w=$(page); [ -n "$w" ] || { echo "the page window vanished on re-maximize"; exit 1; }
+                      kdotool windowactivate "$w" 2>&1
+                      kdotool windowraise "$w" 2>&1
+                      echo "re-presented: $(kdotool getwindowgeometry "$w" 2>&1 | tr '\n' ' ')"
+                  in_container: true
+            # The capture is taken TWICE on purpose, and it is the SECOND frame that is asserted:
+            # a client connecting to the stream right after the stall is served the buffer the
+            # server already held, so the first connection primes a fresh capture and the next one
+            # reads it (measured: the first capture held the stale New Tab frame, the second the
+            # page). This is a re-measurement, not a sleep — the same claim, taken again after the
+            # compositor has had a frame to present.
+            - check: "a VNC screenshot primes the capture session"
+              id: probe-example-vnc-shot
+              context: [runtime]
+              timeout: 240s
+              vnc:
+                  method: screenshot
+                  artifact: /tmp/probe-example-vnc.png
+                  artifact_min_dimensions: 1920x1080
+            - check: "the frame the streamed user sees — the capture taken AFTER the priming one"
+              id: probe-example-vnc-frame
+              context: [runtime]
+              timeout: 240s
+              vnc:
+                  method: screenshot
+                  artifact: /tmp/probe-example-vnc-asserted.png
+                  artifact_min_dimensions: 1920x1080
+            - check: "OCR reads the external page's text out of the VNC frame (what the streamed user sees)"
+              id: probe-example-vnc-ocr
+              context: [runtime]
+              timeout: 120s
+              exit_status: 0
+              stdout:
+                  - contains: documentation examples
+              command:
+                  command: |
+                      magick /tmp/probe-example-vnc-asserted.png -resize 300% /tmp/probe-example-vnc-3x.png
+                      tesseract /tmp/probe-example-vnc-3x.png - --psm 11 2>/dev/null | tr -s ' ' ' ' | grep -Ei -m1 'documentation examples|This is not a service'
+                  in_container: false
             - agent-check: the streamed frame shows a fullscreen KDE Plasma desktop with a maximized Chrome window (title bar and page visible), not a black or gray frame
 
 kde-web-subject:

@@ -39,15 +39,17 @@ declares none of its own.
 
 ## What works, and what does not
 
-- **Every `cdp:` method** against the browser EXCEPT `screenshot`: `status`, `list`, `open`,
-  `close`, `url`, `text`, `html`, `eval`, `axtree`, `wait`, `coords`, `raw`, `click`, `type`. Use
+- **Every `cdp:` method** against the browser: `status`, `list`, `open`, `close`, `url`, `text`,
+  `html`, `eval`, `axtree`, `wait`, `coords`, `raw`, `screenshot`, `click`, `type`. Use
   `context: [runtime]` in a bed; `deploy` is not a check mode and a `deploy`-scoped check step
   is skipped.
-- **`cdp: screenshot` is a measured GPU-Wayland limit here** (`opencharly/plugin-cdp#14`): the
-  surface capture never returns and the plugin's renderer-view fallback comes back uniformly white
-  on every attempt (4/4, 99 s). It is not asserted — a poll cannot fix a capture that is blank by
-  construction — and the visual claim belongs to the VNC frame (`vnc: screenshot` + host OCR),
-  which is what the streamed user actually sees.
+- **`cdp: screenshot` works here, with one platform quirk worth knowing.** On this GPU Wayland
+  Chrome the SURFACE capture (`fromSurface:true`) never returns, so the plugin bounds that attempt
+  and falls back to the renderer-VIEW capture, which returns a real PNG of the page — the bed reads
+  its text back with host OCR. **Do not assert `artifact_not_uniform` on a page capture**: it samples
+  100 pixels at a fixed stride, and a mostly-white page is white at every sample point while the
+  capture is perfectly good (that misreading is what opencharly/plugin-cdp#14 was, and it is closed
+  as not-a-defect). Assert CONTENT — OCR the artifact — or assert bytes/dimensions only.
 - **`cdp: spa-*` does NOT apply.** Those methods drive a Selkies SPA page (canvas + overlay input);
   this pod streams VNC. For desktop-level pointer work use `cdp: coords` for the LOCATE half and
   `vnc: click` / `vnc: type` for the DELIVER half.
@@ -79,11 +81,53 @@ Needs a host with a GPU exposed through CDI (the CPU-only sibling to run instead
 | VNC DRIVES the page | `vnc: click` at the maximized window's centre + `vnc: type` into a CDP-focused field, read back by `cdp: eval` |
 | `$BROWSER`, `chrome-restart` | `command:` `browser-open …`, `chrome-restart`, then `cdp: status` |
 | the MCP catalog | `mcp: ping`, `mcp: list-tools` |
+| a REAL external page, on both capture surfaces | `cdp: open` `https://example.com/` → close every other tab → `title`/`text` needles from its live copy → `cdp: screenshot` + host OCR → the four VNC premises below → `vnc: screenshot` ×2 + host OCR of the second |
 
-The VNC frame is read by `tesseract` ON THE HOST (not in the image), driven from a host-side
-`command:` step because `vnc:` has no `artifact_contains_text`. The marker the frame carries is a
-SINGLE WORD (`CHARLYCDP`): a hyphenated token is the one thing OCR reliably mangles. Prove the
-assertion can fail (a word that is not on screen must go RED) before trusting a green one.
+**Host prerequisites for the OCR steps:** `tesseract` with English data, and `imagemagick`
+(`magick`, used to upscale the 1920x1080 VNC frame 3x before OCR — at native size tesseract reads
+almost nothing off a desktop capture). Both run on the HOST, not in the image, driven from
+host-side `command:` steps because `vnc:` has no `artifact_contains_text`. The marker the VNC frame
+carries is a SINGLE WORD (`CHARLYCDP`): a hyphenated token is the one thing OCR reliably mangles.
+Prove the assertion can fail (a word that is not on screen must go RED) before trusting a green one.
+
+The external-page steps need outbound HTTPS from the host's pod network, and they assert the live
+copy of `https://example.com/` — so a proxy, a captive portal, or a cached page fails them by
+design, visibly, naming egress rather than the pod's internals.
+
+### A capture can carry a STALE frame — assert the premises, then capture TWICE
+
+Measured on this pod: after the supervised browser's `stop → browser-open → chrome-restart` cycle,
+presentation can stall in a way that is invisible to every metadata check. KWin still reports the
+window's title, geometry, desktop and activation; CDP still answers `title`, `text` and the target
+list; and the capture still returns a **complete, coherent, but old** frame — a *New Tab* page from
+before the navigation. Three rounds of window/tab assertions passed while the screen showed that old
+frame. What identifies the stall is the RENDERER, not the metadata:
+
+| probe | stalled | healthy |
+|---|---|---|
+| `Page.captureScreenshot` `fromSurface:true` | hangs | hangs (a known platform quirk) |
+| `Page.captureScreenshot` `fromSurface:false` | **hangs** | answers instantly |
+| `vnc: screenshot`, first connection | old frame | current frame |
+| `vnc: screenshot`, the connection after it | current frame | current frame |
+
+So a VNC-frame assertion in this repo is FOUR premises, each its own step:
+
+1. **The browser is painting** — a view capture answers within a budget (`eventually:` with a
+   `retry_interval:`, so the engine polls; never a hand-rolled sleep). This is the stall's own
+   signal: it is the call that hangs while the renderer is blocked.
+2. **The compositor presents it** — a configure (`kdotool windowstate --remove MAXIMIZED`, then
+   `--add MAXIMIZED`, then activate/raise) makes KWin re-map and re-draw the window. KWin re-maps
+   it, so the window id is re-resolved after every state change.
+3. **One window, and it is the page's** — match by CLASS (`kdotool search --class google-chrome`),
+   never by a title containing "Chrome": a window's title is its page's title, so a stray window is
+   invisible to a title search.
+4. **Two captures, and assert the SECOND** — the connection that arrives right after the stall is
+   served the buffer the server already held; the next one reads the fresh state. This is a
+   re-measurement after the compositor has had a frame to present, not a sleep.
+
+The desktop session also LOCKS itself after ~4 minutes idle, and the greeter covers everything
+(opencharly/pod-kde-nested#6) — assert `org.freedesktop.ScreenSaver.GetActive` is `false` before
+trusting any frame.
 
 ## The pod-to-pod cross-deployment CDP probe (`check-cross-kde-cdp-pod`)
 

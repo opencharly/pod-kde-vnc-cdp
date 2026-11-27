@@ -34,6 +34,14 @@ Canonical files:
   BEHIND the fullscreen Plasma window (a browser there is invisible), a compositor-driven launch
   races the supervisor, and `--start-maximized` alone is not proof on Wayland. The bed asserts all
   three (browser-side `MAXOK`, compositor-side `kdotool` geometry, and both again after a restart).
+- **A VNC-frame assertion needs its premises, and the SECOND capture.** After the supervised
+  browser's restart cycle, presentation can stall while every metadata check still passes: KWin
+  reports the window's title/geometry/activation and CDP answers, but the capture is a complete,
+  coherent, OLD frame. A renderer view capture (`Page.captureScreenshot`, `fromSurface:false`) is
+  the signal — it hangs while stalled and answers instantly when healthy; a configure
+  (un-maximize + re-maximize) makes the compositor re-present; and the first `vnc: screenshot` after
+  the stall is served the buffer the server held, so assert the capture AFTER it. Details and the
+  measured table: `.agents/skills/kde-vnc-cdp/SKILL.md`.
 - **Input in the bed goes through `vnc:`, never `wl: type` or `wl: click`.** KWin implements none
   of the wlroots input protocols; `plugin-wl` fail-fasts them, and `wtype`'s private keymap is
   re-mapped by the nested KWin so typed text arrives garbled.
